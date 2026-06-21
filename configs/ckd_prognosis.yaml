@@ -1,0 +1,30 @@
+# Experiment: 2-year incident-CKD prognosis, multimodal, discrete-time survival.
+# Cohort built with: horizon_days=730, blank_days=30, n_intervals=8.
+
+task_name: ckd_prognosis
+setting: ckd_2y_survival_multimodal
+
+root_path: dataset/ckd
+data: MIMICIV_CKD
+seq_len: 250
+enc_in: 12
+
+d_model: 128
+n_heads: 8
+e_layers: 6
+d_ff: 256
+dropout: 0.1
+patch_len_list: "2,4,8,8,16,16,16,16,32,32,32,32"
+
+use_ecg: true
+use_ehr: true
+ehr_mode: mlp
+fusion: gated
+head: survival
+n_intervals: 8
+
+batch_size: 16
+learning_rate: 0.0001
+train_epochs: 30
+patience: 6
+seed: 41

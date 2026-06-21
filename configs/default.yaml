@@ -1,0 +1,52 @@
+# Default configuration for CardioformerCKD.
+# CLI flags to run.py override anything set here.
+
+task_name: ckd_prognosis
+model: CardioformerCKD
+setting: ckd_default
+
+# data
+root_path: dataset/ckd
+data: MIMICIV_CKD
+seq_len: 250        # ECG window length (250 timestamps = 1 s at 250 Hz)
+enc_in: 12          # 12-lead ECG
+num_workers: 4
+augment: true
+
+# Cardioformer backbone
+d_model: 128
+n_heads: 8
+e_layers: 6
+d_ff: 256
+dropout: 0.1
+patch_len_list: "2,4,8,8,16,16,16,16,32"
+resnet_hidden: 64
+resnet_blocks: 2
+cross_channel: true
+
+# multimodal / prognostic
+use_ecg: true
+use_ehr: true
+ehr_mode: mlp
+ehr_dropout: 0.2
+fusion: gated       # concat | gated | cross
+d_fuse: 256
+head: survival      # binary | survival
+n_intervals: 8
+
+# optimisation
+batch_size: 16
+learning_rate: 0.0001
+weight_decay: 0.0001
+train_epochs: 20
+patience: 5
+lradj: type1
+focal_alpha: 0.25
+focal_gamma: 2.0
+seed: 41
+
+# system
+use_gpu: true
+gpu: 0
+checkpoints: checkpoints/ckd_prognosis
+results: results/ckd_prognosis
