@@ -20,6 +20,7 @@ use_ecg: true
 use_ehr: true
 ehr_mode: mlp
 fusion: gated
+cross_attn_tokens: patches
 head: survival
 n_intervals: 8
 
@@ -27,4 +28,6 @@ batch_size: 16
 learning_rate: 0.0001
 train_epochs: 30
 patience: 6
+lradj: cosine
+min_lr: 0.000001
 seed: 41

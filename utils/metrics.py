@@ -5,7 +5,8 @@ accuracy) and survival-oriented metrics (Harrell's C-index, time-dependent
 AUROC at a chosen horizon bin, and a simple Brier-style calibration error).
 
 scikit-learn is used where available; lightweight fallbacks are provided so the
-core training loop never hard-fails on a metric.
+core training loop never hard-fails on a metric. ``lifelines`` is used for the
+C-index when installed, otherwise a vectorised numpy implementation is used.
 """
 
 import numpy as np
@@ -17,6 +18,12 @@ try:
     _HAS_SK = True
 except Exception:  # pragma: no cover
     _HAS_SK = False
+
+try:  # optional, faster + independently validated
+    from lifelines.utils import concordance_index as _lifelines_cindex
+    _HAS_LIFELINES = True
+except Exception:  # pragma: no cover
+    _HAS_LIFELINES = False
 
 
 def binary_metrics(y_true, y_prob, threshold=0.5):
@@ -40,37 +47,73 @@ def binary_metrics(y_true, y_prob, threshold=0.5):
     return out
 
 
-def concordance_index(event_times, predicted_risk, event_observed):
-    """Harrell's C-index. Higher predicted_risk should mean earlier event.
+def concordance_index(event_times, predicted_risk, event_observed,
+                      use_lifelines=None, block=2048):
+    """Harrell's C-index. Higher ``predicted_risk`` should mean an earlier event.
 
-    A pure-numpy O(n^2) implementation — fine for validation set sizes; swap for
-    ``lifelines.utils.concordance_index`` on very large cohorts.
+    Comparable pairs are (i, j) with i experiencing the event and t_j > t_i. A
+    pair is concordant if r_i > r_j and half-credited if r_i == r_j.
+
+    Implementation
+    --------------
+    Uses ``lifelines.utils.concordance_index`` when lifelines is installed (it
+    takes *risk* here, so the sign is flipped: lifelines expects a score where
+    higher == longer survival). Otherwise falls back to a blocked, vectorised
+    numpy computation -- same O(n^2) pair count, but done in numpy rather than a
+    Python double loop, and streamed in blocks of ``block`` rows so a large test
+    set does not allocate an n x n matrix.
+
+    Set ``use_lifelines=False`` to force the numpy path (used by the tests).
     """
-    t = np.asarray(event_times).ravel()
-    r = np.asarray(predicted_risk).ravel()
+    t = np.asarray(event_times, dtype=np.float64).ravel()
+    r = np.asarray(predicted_risk, dtype=np.float64).ravel()
     e = np.asarray(event_observed).ravel().astype(bool)
 
+    if len(t) == 0 or not e.any():
+        return float("nan")
+
+    if use_lifelines is None:
+        use_lifelines = _HAS_LIFELINES
+    if use_lifelines and _HAS_LIFELINES:
+        try:
+            return float(_lifelines_cindex(t, -r, e.astype(int)))
+        except (ZeroDivisionError, ValueError):  # pragma: no cover
+            return float("nan")
+
     num = den = 0.0
-    n = len(t)
-    for i in range(n):
-        if not e[i]:
-            continue
-        for j in range(n):
-            if t[j] > t[i]:
-                den += 1
-                if r[i] > r[j]:
-                    num += 1
-                elif r[i] == r[j]:
-                    num += 0.5
+    idx_events = np.flatnonzero(e)
+    for s in range(0, idx_events.size, block):
+        i = idx_events[s:s + block]                 # (b,)
+        later = t[None, :] > t[i][:, None]          # (b, n) comparable pairs
+        den += float(later.sum())
+        ri = r[i][:, None]
+        num += float((later & (ri > r[None, :])).sum())
+        num += 0.5 * float((later & (ri == r[None, :])).sum())
     return float(num / den) if den > 0 else float("nan")
+
+
+def horizon_eligibility(event_times, event_indicator, horizon_days):
+    """Who can be scored at a fixed horizon: had the event by then, or was
+    followed at least that far. Subjects censored *before* the horizon have an
+    unknown label and must be dropped -- counting them as negatives inflates the
+    time-dependent AUROC.
+
+    Mirrors ``eligible_binary`` in data_preprocessing/build_cohort.py; use that
+    column when it is available and this helper only as a fallback.
+    """
+    t = np.asarray(event_times, dtype=np.float64).ravel()
+    e = np.asarray(event_indicator).ravel().astype(bool)
+    return (e & (t <= horizon_days)) | (t >= horizon_days)
 
 
 def time_dependent_auroc(cif_at_horizon, label_at_horizon, eligible_mask=None):
     """AUROC of the cumulative incidence prediction at a fixed horizon bin.
 
-    cif_at_horizon : (N,) predicted CIF = 1 - S(t_horizon)
+    cif_at_horizon   : (N,) predicted CIF = 1 - S(t_horizon)
     label_at_horizon : (N,) 1 if event by horizon, else 0
-    eligible_mask : optional (N,) bool, drop subjects censored before horizon
+    eligible_mask    : (N,) bool -- drop subjects censored before the horizon.
+                       Strongly recommended: without it, everyone censored early
+                       is scored as a negative and the metric is optimistic.
     """
     cif = np.asarray(cif_at_horizon).ravel()
     lab = np.asarray(label_at_horizon).ravel()

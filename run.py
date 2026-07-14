@@ -13,24 +13,36 @@ python run.py \
     --use_ecg 1 --use_ehr 1 \
     --batch_size 16 --learning_rate 1e-4 --train_epochs 20 --patience 5
 
-Each parameter is documented inline below. A YAML config can also be supplied
-via --config; CLI flags override YAML values.
+Configuration precedence
+------------------------
+    explicit CLI flag  >  --config YAML  >  argparse default
+
+Implemented in ``resolve_args``: a second, defaults-suppressed parser discovers
+exactly which flags the user typed, and YAML values are only written into keys
+the user did *not* pass. The previous implementation applied the YAML *after*
+parsing, so YAML silently overrode the CLI -- which meant that e.g.
+``--config configs/ckd_prognosis.yaml --use_ehr 0`` did not actually ablate the
+EHR branch.
+
+``resolve_args`` imports nothing heavy, so it is unit-testable without torch
+(see tests/test_config_override.py).
 """
 
 import argparse
 import os
+import sys
 
 import yaml
 
-from exp.exp_ckd_prognosis import Exp_CKD_Prognosis
-
 
 def str2bool(v):
+    if isinstance(v, bool):
+        return v
     return str(v).lower() in ("1", "true", "yes", "y")
 
 
 def build_parser():
-    p = argparse.ArgumentParser(description="CardioformerCKD — prognostic CKD prediction")
+    p = argparse.ArgumentParser(description="CardioformerCKD - prognostic CKD prediction")
 
     # basic
     p.add_argument("--task_name", default="ckd_prognosis")
@@ -64,6 +76,9 @@ def build_parser():
     p.add_argument("--ehr_mode", choices=["mlp", "seq"], default="mlp")
     p.add_argument("--ehr_dropout", type=float, default=0.2)
     p.add_argument("--fusion", choices=["concat", "gated", "cross"], default="gated")
+    p.add_argument("--cross_attn_tokens", choices=["patches", "granularity"], default="patches",
+                   help="what cross-attention fusion attends over: the full multi-granularity patch "
+                        "sequence (default) or only the G pooled granularity summaries (legacy)")
     p.add_argument("--d_fuse", type=int, default=256)
     p.add_argument("--head", choices=["binary", "survival"], default="survival")
     p.add_argument("--n_intervals", type=int, default=8, help="survival time bins over horizon")
@@ -74,7 +89,13 @@ def build_parser():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--train_epochs", type=int, default=20)
     p.add_argument("--patience", type=int, default=5)
-    p.add_argument("--lradj", default="type1")
+    p.add_argument("--lradj", choices=["cosine", "step", "type1", "none"], default="cosine",
+                   help="LR schedule. 'cosine' (default) anneals over train_epochs; 'step' decays "
+                        "by --lr_decay_rate every --lr_decay_every epochs; 'type1' is the legacy "
+                        "halve-every-epoch schedule (kept for reproducibility; not recommended)")
+    p.add_argument("--lr_decay_every", type=int, default=5, help="epochs per decay step (lradj=step)")
+    p.add_argument("--lr_decay_rate", type=float, default=0.5, help="decay factor (lradj=step)")
+    p.add_argument("--min_lr", type=float, default=1e-6, help="floor for the LR schedule")
     p.add_argument("--focal_alpha", type=float, default=0.25)
     p.add_argument("--focal_gamma", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=41)
@@ -84,26 +105,76 @@ def build_parser():
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--devices", default="0")
     p.add_argument("--checkpoints", default="checkpoints/ckd_prognosis")
+    p.add_argument("--checkpoint_path", default=None,
+                   help="explicit checkpoint .pth to load "
+                        "(default: <checkpoints>/<setting>/checkpoint.pth)")
     p.add_argument("--results", default="results/ckd_prognosis")
     return p
 
 
-def apply_yaml(args):
-    if args.config and os.path.exists(args.config):
-        cfg = yaml.safe_load(open(args.config))
-        defaults = {k: v for k, v in cfg.items() if hasattr(args, k)}
-        # only set values the user did not explicitly pass on the CLI
-        for k, v in defaults.items():
-            setattr(args, k, v)
+def _explicit_cli_keys(argv):
+    """Return the set of dests the user actually passed on the command line.
+
+    Re-build the same parser with every default suppressed, so the resulting
+    namespace contains *only* the flags that appeared in ``argv``.
+    """
+    p = build_parser()
+    for action in p._actions:
+        if action.dest != "help":
+            action.default = argparse.SUPPRESS
+    ns, _ = p.parse_known_args(argv)
+    return set(vars(ns).keys())
+
+
+def _coerce(parser, key, value):
+    """Cast a YAML value with the same ``type=`` callable argparse would use."""
+    action = next((a for a in parser._actions if a.dest == key), None)
+    if action is None or action.type is None or isinstance(value, (list, dict)):
+        return value
+    try:
+        return action.type(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def resolve_args(argv=None):
+    """Parse CLI + YAML with precedence: explicit CLI > YAML > argparse default."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    passed = _explicit_cli_keys(argv)
+
+    if args.config:
+        if not os.path.exists(args.config):
+            raise FileNotFoundError(f"--config not found: {args.config}")
+        cfg = yaml.safe_load(open(args.config)) or {}
+        known = {a.dest for a in parser._actions}
+        unknown = sorted(set(cfg) - known)
+        if unknown:
+            print(f"[config] warning: ignoring unknown key(s) in {args.config}: {', '.join(unknown)}")
+        overridden = []
+        for k, v in cfg.items():
+            if k not in known or k == "config":
+                continue
+            if k in passed:                      # explicit CLI flag wins
+                overridden.append(k)
+                continue
+            setattr(args, k, _coerce(parser, k, v))
+        if overridden:
+            print(f"[config] CLI overrides YAML for: {', '.join(sorted(overridden))}")
+
+    args.cli_overrides = sorted(passed - {"config"})
     return args
 
 
-def main():
-    args = build_parser().parse_args()
-    args = apply_yaml(args)
+def main(argv=None):
+    args = resolve_args(argv)
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", args.devices)
     print("Args:", vars(args))
+
+    # imported late so resolve_args() stays importable without torch installed
+    from exp.exp_ckd_prognosis import Exp_CKD_Prognosis
 
     exp = Exp_CKD_Prognosis(args)
     if args.is_training:

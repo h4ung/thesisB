@@ -7,5 +7,6 @@ pyarrow>=12.0
 PyYAML>=6.0
 wfdb>=4.1
 tqdm>=4.65
-# optional, for a faster/validated concordance index on large cohorts:
+# optional: utils.metrics auto-detects lifelines and uses it for the C-index
+# (the numpy fallback is vectorised and gives identical values, just slower)
 # lifelines>=0.27

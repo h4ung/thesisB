@@ -25,6 +25,7 @@ class Cfg:
     ehr_mode = "mlp"
     ehr_dropout = 0.2
     fusion = "gated"
+    cross_attn_tokens = "patches"
     d_fuse = 64
     head = "survival"
     n_intervals = 8
@@ -79,3 +80,46 @@ def test_backward_pass():
     loss.backward()
     grads = [p.grad is not None for p in model.parameters() if p.requires_grad]
     assert any(grads)
+
+
+def test_backbone_returns_full_patch_token_sequence():
+    """encode(return_tokens=True) must hand back every patch token, not G pooled
+    summaries: T = sum_g ceil(seq_len / patch_len_g)."""
+    import math
+
+    from models.Cardioformer import Model as Backbone
+
+    cfg = Cfg()
+    backbone = Backbone(cfg)
+    x_ecg, _ = _batch()
+    feats, tokens = backbone.encode(x_ecg, return_tokens=True)
+
+    patch_lens = [int(p) for p in cfg.patch_len_list.split(",")]
+    expected_T = sum(math.ceil(cfg.seq_len / p) for p in patch_lens)
+    assert feats.shape == (4, len(patch_lens) * cfg.d_model)
+    assert tokens.shape == (4, expected_T, cfg.d_model)
+    assert tokens.shape[1] > len(patch_lens)   # not just the pooled summaries
+
+
+def test_cross_fusion_attends_over_patches_not_only_granularities():
+    import math
+
+    cfg = Cfg(); cfg.fusion = "cross"; cfg.cross_attn_tokens = "patches"
+    model = CardioformerCKD(cfg)
+    x_ecg, ehr = _batch()
+    out = model(x_ecg=x_ecg, ehr=ehr)
+    assert out.shape == (4, cfg.n_intervals)
+
+    patch_lens = [int(p) for p in cfg.patch_len_list.split(",")]
+    expected_T = sum(math.ceil(cfg.seq_len / p) for p in patch_lens)
+    # attention weights are (B, 1 query, T keys)
+    assert model.fuse.last_attn.shape == (4, 1, expected_T)
+
+
+def test_cross_fusion_granularity_mode_is_still_available():
+    cfg = Cfg(); cfg.fusion = "cross"; cfg.cross_attn_tokens = "granularity"
+    model = CardioformerCKD(cfg)
+    x_ecg, ehr = _batch()
+    out = model(x_ecg=x_ecg, ehr=ehr)
+    assert out.shape == (4, cfg.n_intervals)
+    assert model.fuse.last_attn.shape == (4, 1, model.n_gran)

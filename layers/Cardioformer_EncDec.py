@@ -79,9 +79,19 @@ class CardioformerEncoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, streams):
+    def forward(self, streams, return_streams=False):
+        """streams: list of (B, n_g, d_model).
+
+        Returns the per-granularity pooled representation ``(B, G, d_model)``.
+        With ``return_streams=True`` the *full* normalised token sequences are
+        also returned, so a downstream module (e.g. the cross-attention fusion in
+        ``models.CardioformerCKD``) can attend over every patch token instead of
+        only the G pooled summaries.
+        """
         for layer in self.layers:
             streams = layer(streams)
-        # final representation: concat the mean-pooled token of each granularity
-        pooled = [self.norm(s).mean(dim=1) for s in streams]   # list of (B, d_model)
-        return torch.stack(pooled, dim=1)                      # (B, G, d_model)
+        normed = [self.norm(s) for s in streams]               # list of (B, n_g, d_model)
+        pooled = torch.stack([s.mean(dim=1) for s in normed], dim=1)   # (B, G, d_model)
+        if return_streams:
+            return pooled, normed
+        return pooled

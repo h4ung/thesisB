@@ -1,5 +1,7 @@
 # Default configuration for CardioformerCKD.
-# CLI flags to run.py override anything set here.
+# Precedence: explicit CLI flag > this file > argparse default.
+# (run.py::resolve_args only fills in keys you did NOT pass on the command line,
+#  so e.g. `--config configs/default.yaml --use_ehr 0` really does ablate EHR.)
 
 task_name: ckd_prognosis
 model: CardioformerCKD
@@ -30,6 +32,7 @@ use_ehr: true
 ehr_mode: mlp
 ehr_dropout: 0.2
 fusion: gated       # concat | gated | cross
+cross_attn_tokens: patches   # patches | granularity (cross fusion only)
 d_fuse: 256
 head: survival      # binary | survival
 n_intervals: 8
@@ -40,7 +43,10 @@ learning_rate: 0.0001
 weight_decay: 0.0001
 train_epochs: 20
 patience: 5
-lradj: type1
+lradj: cosine       # cosine | step | type1 (legacy: halves LR every epoch) | none
+lr_decay_every: 5   # lradj=step only
+lr_decay_rate: 0.5  # lradj=step only
+min_lr: 0.000001
 focal_alpha: 0.25
 focal_gamma: 2.0
 seed: 41

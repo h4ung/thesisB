@@ -17,7 +17,12 @@ the cohort builder (``data_preprocessing/build_cohort.py``), not here.
 
 ``configs`` reuses the Cardioformer attributes (see models/Cardioformer.py) plus:
 ehr_in_dim, ehr_mode ('mlp'|'seq'), fusion ('concat'|'gated'|'cross'),
+cross_attn_tokens ('patches'|'granularity', cross fusion only),
 head ('binary'|'survival'), n_intervals (survival only), use_ecg, use_ehr.
+
+Provenance: the ECG backbone is a clean-room re-implementation of Cardioformer
+from the paper (Mobin et al., 2025, arXiv:2505.05538), not the authors' code.
+See the note in models/Cardioformer.py.
 """
 
 import torch
@@ -45,22 +50,44 @@ class GatedFusion(nn.Module):
 
 
 class CrossAttentionFusion(nn.Module):
-    """EHR embedding attends over per-granularity ECG tokens (and vice versa)."""
+    """EHR embedding attends over the ECG token sequence.
 
-    def __init__(self, d_ecg_token, d_ehr, d_out, n_heads=4):
+    ``ecg_tokens`` is the *full* multi-granularity patch sequence (B, T, d_model)
+    with T = sum_g ceil(seq_len / patch_len_g) -- a few hundred tokens for a 250-
+    sample window. Attending over these lets the EHR query select which parts of
+    the waveform (and which scale) matter for this patient.
+
+    Set ``configs.cross_attn_tokens='granularity'`` to attend over only the G
+    pooled per-granularity summaries instead (the original behaviour, kept for
+    ablation; it is a much weaker form of cross-attention because the pooling has
+    already discarded the within-granularity structure).
+    """
+
+    def __init__(self, d_ecg_token, d_ehr, d_out, n_heads=4, dropout=0.1):
         super().__init__()
         self.q = nn.Linear(d_ehr, d_out)
         self.kv = nn.Linear(d_ecg_token, d_out)
-        self.attn = nn.MultiheadAttention(d_out, n_heads, batch_first=True)
+        self.attn = nn.MultiheadAttention(d_out, n_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(d_out)
         self.out = nn.Linear(d_out + d_ehr, d_out)
 
-    def forward(self, ecg_tokens, z_ehr):
-        # ecg_tokens: (B, G, d_ecg_token); z_ehr: (B, d_ehr)
-        q = self.q(z_ehr).unsqueeze(1)          # (B,1,d_out)
-        kv = self.kv(ecg_tokens)                # (B,G,d_out)
-        ctx, _ = self.attn(q, kv, kv)           # (B,1,d_out)
-        ctx = ctx.squeeze(1)
+    def forward(self, ecg_tokens, z_ehr, key_padding_mask=None):
+        # ecg_tokens: (B, T, d_ecg_token); z_ehr: (B, d_ehr)
+        q = self.q(z_ehr).unsqueeze(1)                       # (B, 1, d_out)
+        kv = self.kv(ecg_tokens)                             # (B, T, d_out)
+        ctx, attn = self.attn(q, kv, kv, key_padding_mask=key_padding_mask,
+                              need_weights=True)             # ctx (B,1,d_out), attn (B,1,T)
+        self.last_attn = attn.detach()                       # kept for interpretability plots
+        ctx = self.norm(q + ctx).squeeze(1)                  # residual around the query
         return self.out(torch.cat([ctx, z_ehr], dim=-1))
+
+
+def _pick_heads(d_out, desired):
+    """Largest head count <= desired that divides d_out (MultiheadAttention requires it)."""
+    for h in range(max(1, min(int(desired), int(d_out))), 0, -1):
+        if d_out % h == 0:
+            return h
+    return 1
 
 
 class CardioformerCKD(nn.Module):
@@ -69,6 +96,9 @@ class CardioformerCKD(nn.Module):
         self.use_ecg = getattr(configs, "use_ecg", True)
         self.use_ehr = getattr(configs, "use_ehr", True)
         self.fusion_mode = getattr(configs, "fusion", "gated")
+        # 'patches' -> attend over every patch token; 'granularity' -> only the G
+        # pooled granularity summaries (legacy behaviour, weaker).
+        self.cross_attn_tokens = getattr(configs, "cross_attn_tokens", "patches")
         self.head_type = getattr(configs, "head", "survival")
         self.d_model = configs.d_model
 
@@ -110,7 +140,11 @@ class CardioformerCKD(nn.Module):
             elif self.fusion_mode == "gated":
                 self.fuse = GatedFusion(d_ecg, d_ehr, d_fuse)
             elif self.fusion_mode == "cross":
-                self.fuse = CrossAttentionFusion(configs.d_model, d_ehr, d_fuse)
+                self.fuse = CrossAttentionFusion(
+                    configs.d_model, d_ehr, d_fuse,
+                    n_heads=_pick_heads(d_fuse, getattr(configs, "n_heads", 4)),
+                    dropout=getattr(configs, "dropout", 0.1),
+                )
             else:
                 raise ValueError(f"unknown fusion: {self.fusion_mode}")
         else:
@@ -127,17 +161,29 @@ class CardioformerCKD(nn.Module):
         else:
             raise ValueError(f"unknown head: {self.head_type}")
 
-    def _encode_ecg(self, x_ecg):
-        feats = self.ecg.encode(x_ecg)                         # (B, G*d_model)
-        tokens = feats.view(feats.size(0), self.n_gran, self.d_model)  # for cross-attn
+    def _encode_ecg(self, x_ecg, need_tokens=False):
+        """Return the pooled ECG embedding and, when needed, the token sequence.
+
+        ``need_tokens`` asks the backbone for the full multi-granularity patch
+        sequence (B, T, d_model). The previous version reshaped the pooled vector
+        into (B, G, d_model), so 'cross' fusion could only ever attend over G
+        granularity summaries -- not over the waveform itself.
+        """
+        if not need_tokens:
+            return self.ecg.encode(x_ecg), None
+        if self.cross_attn_tokens == "granularity":
+            feats = self.ecg.encode(x_ecg)                              # (B, G*d_model)
+            return feats, feats.view(feats.size(0), self.n_gran, self.d_model)
+        feats, tokens = self.ecg.encode(x_ecg, return_tokens=True)      # (B, T, d_model)
         return feats, tokens
 
     def forward(self, x_ecg=None, ehr=None, ehr_mask=None):
         z_ecg = z_ehr = None
         ecg_tokens = None
 
+        need_tokens = self.use_ecg and self.use_ehr and self.fusion_mode == "cross"
         if self.use_ecg:
-            z_ecg, ecg_tokens = self._encode_ecg(x_ecg)
+            z_ecg, ecg_tokens = self._encode_ecg(x_ecg, need_tokens=need_tokens)
         if self.use_ehr:
             if isinstance(self.ehr, EHRSequenceEncoder):
                 z_ehr = self.ehr(ehr, key_padding_mask=ehr_mask)

@@ -15,14 +15,42 @@ def set_seed(seed=41):
 
 
 def adjust_learning_rate(optimizer, epoch, args):
-    if getattr(args, "lradj", "type1") == "type1":
-        lr = args.learning_rate * (0.5 ** ((epoch - 1) // 1))
-    elif args.lradj == "cosine":
-        lr = args.learning_rate / 2 * (1 + np.cos(np.pi * epoch / args.train_epochs))
+    """Set the LR for ``epoch`` (1-indexed) according to ``args.lradj``.
+
+    Schedules
+    ---------
+    cosine : lr * 0.5 * (1 + cos(pi * (epoch-1) / train_epochs))   [default]
+    step   : lr * lr_decay_rate ** ((epoch-1) // lr_decay_every)
+    type1  : lr * 0.5 ** (epoch-1)  -- legacy Time-Series-Library schedule. This
+             halves the LR *every* epoch, so by epoch 10 it is ~1e-3 of the
+             initial value and training has effectively stopped. Kept only so
+             older runs remain reproducible; do not use it for new experiments.
+    none   : constant LR.
+
+    Every schedule is floored at ``args.min_lr`` (default 1e-6).
+    """
+    base = args.learning_rate
+    mode = getattr(args, "lradj", "cosine")
+    min_lr = float(getattr(args, "min_lr", 1e-6))
+    total = max(int(getattr(args, "train_epochs", 1)), 1)
+
+    if mode in ("none", "const", "constant"):
+        return None
+    if mode == "cosine":
+        lr = base * 0.5 * (1 + np.cos(np.pi * min((epoch - 1) / total, 1.0)))
+    elif mode == "step":
+        every = max(int(getattr(args, "lr_decay_every", 5)), 1)
+        rate = float(getattr(args, "lr_decay_rate", 0.5))
+        lr = base * (rate ** ((epoch - 1) // every))
+    elif mode == "type1":
+        lr = base * (0.5 ** (epoch - 1))
     else:
-        return
+        return None
+
+    lr = max(lr, min_lr)
     for pg in optimizer.param_groups:
         pg["lr"] = lr
+    return lr
 
 
 class EarlyStopping:

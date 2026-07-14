@@ -1,10 +1,27 @@
 """Cardioformer ECG backbone.
 
-Re-implementation of the Cardioformer encoder (Mobin et al., 2025) following the
-Time-Series-Library ``Model(configs)`` convention so it can be used as a drop-in
-ECG encoder. The original repo exposes a ``classification`` task head; here the
-backbone is reusable for both classification and as a feature extractor for the
-multimodal prognostic model (``models.CardioformerCKD``).
+PROVENANCE / CLEAN-ROOM NOTE
+---------------------------
+This is an *independent clean-room re-implementation* of the Cardioformer encoder
+written from the description in the paper (Mobin et al., "Cardioformer:
+Advancing AI in ECG Analysis with Multi-Granularity Patching and ResNet",
+arXiv:2505.05538, 2025). No code from the authors' repository was used, and the
+implementation has not been verified against their released weights or results.
+
+Consequences that must be stated in the thesis:
+  * published Cardioformer numbers are NOT directly comparable to numbers from
+    this code -- any ECG-only baseline here is "our re-implementation of
+    Cardioformer", not "Cardioformer";
+  * undocumented details (patch strides, router-token design, normalisation
+    placement, initialisation) are our own choices and are documented in
+    layers/Embed.py and layers/Cardioformer_EncDec.py;
+  * a gap against the published results is therefore expected and should not be
+    reported as a failure to reproduce the paper.
+
+It follows the Time-Series-Library ``Model(configs)`` convention so it can be used
+as a drop-in ECG encoder. The backbone is reusable both for classification and as
+a feature extractor for the multimodal prognostic model
+(``models.CardioformerCKD``).
 
 Expected ``configs`` attributes
 -------------------------------
@@ -70,10 +87,22 @@ class Model(nn.Module):
             self.projection = nn.Linear(self.n_gran * configs.d_model, configs.num_class)
 
     # ---- core feature extractor --------------------------------------------
-    def encode(self, x_enc):
-        """x_enc: (B, seq_len, enc_in) in TSLib layout. Returns (B, G*d_model)."""
+    def encode(self, x_enc, return_tokens=False):
+        """x_enc: (B, seq_len, enc_in) in TSLib layout.
+
+        Returns ``(B, G*d_model)``: the mean-pooled token of each granularity,
+        concatenated. With ``return_tokens=True`` also returns the full patch
+        token sequence ``(B, T, d_model)`` -- every token from every granularity
+        concatenated along time, where ``T = sum_g ceil(seq_len / patch_len_g)``.
+        The pooled vector alone throws that sequence away, which is why the
+        cross-attention fusion needs this flag (see models/CardioformerCKD.py).
+        """
         x = x_enc.permute(0, 2, 1).contiguous()   # -> (B, C, L)
         streams = self.embedding(x)               # list of (B, n_g, d_model)
+        if return_tokens:
+            enc, normed = self.encoder(streams, return_streams=True)
+            tokens = torch.cat(normed, dim=1)     # (B, T, d_model)
+            return enc.reshape(enc.size(0), -1), tokens
         enc = self.encoder(streams)               # (B, G, d_model)
         return enc.reshape(enc.size(0), -1)       # (B, G*d_model)
 
